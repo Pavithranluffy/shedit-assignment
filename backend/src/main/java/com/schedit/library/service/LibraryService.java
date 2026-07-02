@@ -1,8 +1,17 @@
 package com.schedit.library.service;
 
-import com.schedit.library.model.*;
-import com.schedit.library.repository.*;
-import org.springframework.beans.factory.annotation.Autowired;
+import com.schedit.library.model.Book;
+import com.schedit.library.model.BookCopy;
+import com.schedit.library.model.Loan;
+import com.schedit.library.model.Member;
+import com.schedit.library.model.WaitingListEntry;
+import com.schedit.library.repository.BookCopyRepository;
+import com.schedit.library.repository.BookRepository;
+import com.schedit.library.repository.LoanRepository;
+import com.schedit.library.repository.MemberRepository;
+import com.schedit.library.repository.WaitingListEntryRepository;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -13,8 +22,15 @@ import java.time.temporal.ChronoUnit;
 import java.util.List;
 import java.util.Optional;
 
+/**
+ * Central service containing the business rules for borrowing, returning, waitlisting, and inventory actions.
+ */
 @Service
 public class LibraryService {
+
+    private static final Logger log = LoggerFactory.getLogger(LibraryService.class);
+    private static final BigDecimal DAILY_LATE_FEE = new BigDecimal("1.00");
+    private static final int RESERVATION_EXPIRY_DAYS = 3;
 
     private final BookRepository bookRepository;
     private final BookCopyRepository copyRepository;
@@ -23,9 +39,9 @@ public class LibraryService {
     private final WaitingListEntryRepository waitlistRepository;
     private final ClockService clockService;
 
-    private static final BigDecimal DAILY_LATE_FEE = new BigDecimal("1.00");
-
-    @Autowired
+    /**
+     * Creates the service with the repositories it needs to enforce library rules.
+     */
     public LibraryService(BookRepository bookRepository,
                           BookCopyRepository copyRepository,
                           MemberRepository memberRepository,
@@ -40,6 +56,9 @@ public class LibraryService {
         this.clockService = clockService;
     }
 
+    /**
+     * Borrows a book for a member if the member is eligible and the inventory permits it.
+     */
     @Transactional
     public Loan borrowBook(Long memberId, Long bookId) {
         LocalDate today = clockService.getVirtualDate();
@@ -48,46 +67,32 @@ public class LibraryService {
         Book book = bookRepository.findById(bookId)
                 .orElseThrow(() -> new IllegalArgumentException("Book not found"));
 
-        // Rule 5: Check outstanding late fees
-        if (member.getBalance().compareTo(BigDecimal.ZERO) > 0) {
-            throw new IllegalStateException("Cannot borrow new books with outstanding late fees. Please settle fees first.");
-        }
+        validateNoOutstandingFees(member, "borrow new books");
+        validateBorrowingCapacity(member);
 
-        // Rule 1: Check borrowing limits
-        List<Loan> activeLoans = loanRepository.findByMemberAndReturnDateIsNull(member);
-        if (activeLoans.size() >= member.getTier().getMaxBooks()) {
-            throw new IllegalStateException("Borrowing limit reached for membership tier: Max " + member.getTier().getMaxBooks() + " books.");
-        }
-
-        // Rule 3 (partial): Can't borrow a book you already have out
         if (loanRepository.existsActiveLoanForMemberAndBook(member, book)) {
             throw new IllegalStateException("You already have an active loan for this book.");
         }
 
-        // Check if there are waitlists
         List<WaitingListEntry> activeWaitlist = waitlistRepository.findActiveByBookOrderByCreatedAtAsc(book);
-        boolean hasQueue = !activeWaitlist.isEmpty();
-
-        if (hasQueue) {
-            // Check if this member is at the front of the queue and has a RESERVED copy
+        if (!activeWaitlist.isEmpty()) {
             Optional<WaitingListEntry> reservationOpt = activeWaitlist.stream()
-                    .filter(w -> w.getMember().getId().equals(memberId) && w.getStatus() == WaitingListEntry.WaitlistStatus.RESERVED)
+                    .filter(waitingEntry -> waitingEntry.getMember().getId().equals(memberId)
+                            && waitingEntry.getStatus() == WaitingListEntry.WaitlistStatus.RESERVED)
                     .findFirst();
 
             if (reservationOpt.isPresent()) {
                 WaitingListEntry reservation = reservationOpt.get();
-                // Check if expired
                 if (isReservationExpired(reservation, today)) {
                     expireReservation(reservation);
                     throw new IllegalStateException("Your reservation has expired.");
                 }
+                log.info("Collecting reservation {} for member {}", reservation.getId(), memberId);
                 return collectReservationInternal(member, reservation, today);
-            } else {
-                throw new IllegalStateException("This book is currently reserved or has a waiting list. You must join the waiting list.");
             }
+            throw new IllegalStateException("This book is currently reserved or has a waiting list. You must join the waiting list.");
         }
 
-        // If no queue, look for an available copy
         List<BookCopy> availableCopies = copyRepository.findByBookAndStatus(book, BookCopy.CopyStatus.AVAILABLE);
         if (availableCopies.isEmpty()) {
             throw new IllegalStateException("No available copies. You must join the waiting list.");
@@ -99,9 +104,14 @@ public class LibraryService {
 
         LocalDate dueDate = today.plusDays(member.getTier().getLoanPeriodDays());
         Loan loan = new Loan(copyToBorrow, member, today, dueDate);
-        return loanRepository.save(loan);
+        Loan savedLoan = loanRepository.save(loan);
+        log.info("Created loan {} for member {}", savedLoan.getId(), memberId);
+        return savedLoan;
     }
 
+    /**
+     * Returns a checked-out copy and applies fees if the loan is overdue.
+     */
     @Transactional
     public Loan returnBookCopy(Long copyId) {
         LocalDate today = clockService.getVirtualDate();
@@ -113,7 +123,6 @@ public class LibraryService {
 
         loan.setReturnDate(today);
 
-        // Calculate late fee
         long daysLate = ChronoUnit.DAYS.between(loan.getDueDate(), today);
         if (daysLate > 0) {
             BigDecimal charge = DAILY_LATE_FEE.multiply(new BigDecimal(daysLate));
@@ -128,17 +137,17 @@ public class LibraryService {
         }
 
         loanRepository.save(loan);
-
-        // Return the copy back to Available
         copy.setStatus(BookCopy.CopyStatus.AVAILABLE);
         copyRepository.save(copy);
-
-        // Process reservation queue
         processReservationQueue(copy.getBook(), today);
 
+        log.info("Returned copy {} and processed queue for book {}", copyId, copy.getBook().getId());
         return loan;
     }
 
+    /**
+     * Renews an active loan if the member remains eligible under the current policy.
+     */
     @Transactional
     public Loan renewLoan(Long loanId) {
         LocalDate today = clockService.getVirtualDate();
@@ -150,35 +159,28 @@ public class LibraryService {
         }
 
         Member member = loan.getMember();
+        validateNoOutstandingFees(member, "renew loans");
+        validateRenewalCapacity(member);
 
-        // Rule 5: Cannot renew with outstanding fees
-        if (member.getBalance().compareTo(BigDecimal.ZERO) > 0) {
-            throw new IllegalStateException("Cannot renew with outstanding late fees. Please settle fees first.");
-        }
-
-        // Rule 7 (Downgrade constraint): If member active loans exceed max tier allowed, block renewals
-        List<Loan> activeLoans = loanRepository.findByMemberAndReturnDateIsNull(member);
-        if (activeLoans.size() > member.getTier().getMaxBooks()) {
-            throw new IllegalStateException("Cannot renew. You currently have " + activeLoans.size() 
-                    + " books checked out, which exceeds your tier limit of " + member.getTier().getMaxBooks() + ".");
-        }
-
-        // Rule 2: Can renew unless someone else is waiting for that title
-        // In this context, someone waiting means there is an entry with status WAITING
         List<WaitingListEntry> activeWaitlist = waitlistRepository.findActiveByBookOrderByCreatedAtAsc(loan.getBookCopy().getBook());
         boolean hasWaitingMember = activeWaitlist.stream()
-                .anyMatch(w -> w.getStatus() == WaitingListEntry.WaitlistStatus.WAITING && !w.getMember().getId().equals(member.getId()));
+                .anyMatch(waitingEntry -> waitingEntry.getStatus() == WaitingListEntry.WaitlistStatus.WAITING
+                        && !waitingEntry.getMember().getId().equals(member.getId()));
 
         if (hasWaitingMember) {
             throw new IllegalStateException("Cannot renew. Another member is currently waiting for this book.");
         }
 
-        // Extend due date
         LocalDate newDueDate = loan.getDueDate().plusDays(member.getTier().getLoanPeriodDays());
         loan.setDueDate(newDueDate);
-        return loanRepository.save(loan);
+        Loan savedLoan = loanRepository.save(loan);
+        log.info("Renewed loan {} for member {} on {}", loanId, member.getId(), today);
+        return savedLoan;
     }
 
+    /**
+     * Adds a member to the waiting list for a book.
+     */
     @Transactional
     public WaitingListEntry joinWaitlist(Long memberId, Long bookId) {
         LocalDate today = clockService.getVirtualDate();
@@ -187,26 +189,25 @@ public class LibraryService {
         Book book = bookRepository.findById(bookId)
                 .orElseThrow(() -> new IllegalArgumentException("Book not found"));
 
-        // Rule 3: Only be on waiting list once for same book
         if (waitlistRepository.existsActiveEntryForMemberAndBook(member, book)) {
             throw new IllegalStateException("You are already on the waiting list for this book.");
         }
 
-        // Rule 3: Can't be on waitlist for a book you already have out
         if (loanRepository.existsActiveLoanForMemberAndBook(member, book)) {
             throw new IllegalStateException("You already have an active loan for this book.");
         }
 
         LocalDateTime createdAt = today.atStartOfDay();
         WaitingListEntry entry = new WaitingListEntry(book, member, createdAt, WaitingListEntry.WaitlistStatus.WAITING);
-        waitlistRepository.save(entry);
-
-        // Process reservation queue (in case there's an available copy)
+        WaitingListEntry savedEntry = waitlistRepository.save(entry);
         processReservationQueue(book, today);
-
-        return entry;
+        log.info("Member {} joined waitlist {}", memberId, savedEntry.getId());
+        return savedEntry;
     }
 
+    /**
+     * Cancels an active waitlist entry and returns any reserved copy to the pool when appropriate.
+     */
     @Transactional
     public WaitingListEntry cancelWaitlist(Long entryId) {
         LocalDate today = clockService.getVirtualDate();
@@ -230,9 +231,13 @@ public class LibraryService {
             processReservationQueue(copy.getBook(), today);
         }
 
+        log.info("Cancelled waitlist entry {}", entryId);
         return entry;
     }
 
+    /**
+     * Collects a reservation for a member and creates an active loan.
+     */
     @Transactional
     public Loan collectReservation(Long memberId, Long entryId) {
         LocalDate today = clockService.getVirtualDate();
@@ -249,18 +254,9 @@ public class LibraryService {
             throw new IllegalStateException("This entry is not in reserved status");
         }
 
-        // Rule 5: Outstanding late fees
-        if (member.getBalance().compareTo(BigDecimal.ZERO) > 0) {
-            throw new IllegalStateException("Cannot collect reservation with outstanding late fees. Please settle fees first.");
-        }
+        validateNoOutstandingFees(member, "collect reservations");
+        validateBorrowingCapacity(member);
 
-        // Rule 1: Check borrowing limits
-        List<Loan> activeLoans = loanRepository.findByMemberAndReturnDateIsNull(member);
-        if (activeLoans.size() >= member.getTier().getMaxBooks()) {
-            throw new IllegalStateException("Borrowing limit reached for membership tier: Max " + member.getTier().getMaxBooks() + " books.");
-        }
-
-        // Check expiration
         if (isReservationExpired(entry, today)) {
             expireReservation(entry);
             processReservationQueue(entry.getBook(), today);
@@ -270,6 +266,9 @@ public class LibraryService {
         return collectReservationInternal(member, entry, today);
     }
 
+    /**
+     * Expires any reservation that has exceeded its collection window.
+     */
     @Transactional
     public void triggerExpirations() {
         LocalDate today = clockService.getVirtualDate();
@@ -282,6 +281,9 @@ public class LibraryService {
         }
     }
 
+    /**
+     * Marks a copy as lost and applies the replacement cost as a fee if the item was on loan.
+     */
     @Transactional
     public BookCopy markCopyLost(Long copyId) {
         LocalDate today = clockService.getVirtualDate();
@@ -293,7 +295,6 @@ public class LibraryService {
         }
 
         if (copy.getStatus() == BookCopy.CopyStatus.ON_LOAN) {
-            // Find active loan and return with full replacement cost as fee
             Loan loan = loanRepository.findByBookCopyAndReturnDateIsNull(copy)
                     .orElseThrow(() -> new IllegalStateException("Copy state is ON_LOAN but no active loan found"));
             loan.setReturnDate(today);
@@ -305,15 +306,13 @@ public class LibraryService {
             member.setBalance(member.getBalance().add(cost));
             memberRepository.save(member);
         } else if (copy.getStatus() == BookCopy.CopyStatus.RESERVED) {
-            // Find waitlist entry
             List<WaitingListEntry> reserved = waitlistRepository.findByBookAndStatusOrderByCreatedAtAsc(copy.getBook(), WaitingListEntry.WaitlistStatus.RESERVED);
             Optional<WaitingListEntry> entryOpt = reserved.stream()
-                    .filter(w -> w.getReservedCopy() != null && w.getReservedCopy().getId().equals(copyId))
+                    .filter(waitingEntry -> waitingEntry.getReservedCopy() != null && waitingEntry.getReservedCopy().getId().equals(copyId))
                     .findFirst();
 
             if (entryOpt.isPresent()) {
                 WaitingListEntry entry = entryOpt.get();
-                // Put back to waiting queue
                 entry.setStatus(WaitingListEntry.WaitlistStatus.WAITING);
                 entry.setReservedCopy(null);
                 entry.setReservedAt(null);
@@ -323,12 +322,14 @@ public class LibraryService {
 
         copy.setStatus(BookCopy.CopyStatus.LOST);
         BookCopy saved = copyRepository.save(copy);
-
-        // Try to reserve for the displaced user or others if other copies exist
         processReservationQueue(copy.getBook(), today);
+        log.info("Marked copy {} as lost", copyId);
         return saved;
     }
 
+    /**
+     * Marks a copy as damaged and re-queues any affected reservations.
+     */
     @Transactional
     public BookCopy markCopyDamaged(Long copyId) {
         LocalDate today = clockService.getVirtualDate();
@@ -342,7 +343,7 @@ public class LibraryService {
         if (copy.getStatus() == BookCopy.CopyStatus.RESERVED) {
             List<WaitingListEntry> reserved = waitlistRepository.findByBookAndStatusOrderByCreatedAtAsc(copy.getBook(), WaitingListEntry.WaitlistStatus.RESERVED);
             Optional<WaitingListEntry> entryOpt = reserved.stream()
-                    .filter(w -> w.getReservedCopy() != null && w.getReservedCopy().getId().equals(copyId))
+                    .filter(waitingEntry -> waitingEntry.getReservedCopy() != null && waitingEntry.getReservedCopy().getId().equals(copyId))
                     .findFirst();
 
             if (entryOpt.isPresent()) {
@@ -356,12 +357,10 @@ public class LibraryService {
 
         copy.setStatus(BookCopy.CopyStatus.DAMAGED);
         BookCopy saved = copyRepository.save(copy);
-
         processReservationQueue(copy.getBook(), today);
+        log.info("Marked copy {} as damaged", copyId);
         return saved;
     }
-
-    // --- Helper Methods ---
 
     private Loan collectReservationInternal(Member member, WaitingListEntry reservation, LocalDate today) {
         BookCopy copy = reservation.getReservedCopy();
@@ -370,7 +369,7 @@ public class LibraryService {
 
         LocalDate dueDate = today.plusDays(member.getTier().getLoanPeriodDays());
         Loan loan = new Loan(copy, member, today, dueDate);
-        
+
         reservation.setStatus(WaitingListEntry.WaitlistStatus.FULFILLED);
         waitlistRepository.save(reservation);
 
@@ -401,8 +400,7 @@ public class LibraryService {
             return false;
         }
         LocalDate reservedDate = entry.getReservedAt().toLocalDate();
-        // 3 days to collect: if current date is > reservedDate + 3 days, it's expired
-        return today.isAfter(reservedDate.plusDays(3));
+        return today.isAfter(reservedDate.plusDays(RESERVATION_EXPIRY_DAYS));
     }
 
     private void expireReservation(WaitingListEntry entry) {
@@ -416,4 +414,26 @@ public class LibraryService {
             copyRepository.save(copy);
         }
     }
+
+    private void validateNoOutstandingFees(Member member, String action) {
+        if (member.getBalance().compareTo(BigDecimal.ZERO) > 0) {
+            throw new IllegalStateException("Cannot " + action + " with outstanding late fees. Please settle fees first.");
+        }
+    }
+
+    private void validateBorrowingCapacity(Member member) {
+        List<Loan> activeLoans = loanRepository.findByMemberAndReturnDateIsNull(member);
+        if (activeLoans.size() >= member.getTier().getMaxBooks()) {
+            throw new IllegalStateException("Borrowing limit reached for membership tier: Max " + member.getTier().getMaxBooks() + " books.");
+        }
+    }
+
+    private void validateRenewalCapacity(Member member) {
+        List<Loan> activeLoans = loanRepository.findByMemberAndReturnDateIsNull(member);
+        if (activeLoans.size() > member.getTier().getMaxBooks()) {
+            throw new IllegalStateException("Cannot renew. You currently have " + activeLoans.size()
+                    + " books checked out, which exceeds your tier limit of " + member.getTier().getMaxBooks() + ".");
+        }
+    }
 }
+

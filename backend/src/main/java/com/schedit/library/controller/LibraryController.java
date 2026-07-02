@@ -1,20 +1,44 @@
 package com.schedit.library.controller;
 
-import com.schedit.library.dto.Dtos.*;
-import com.schedit.library.model.*;
-import com.schedit.library.repository.*;
+import com.schedit.library.dto.Dtos.AddBookRequest;
+import com.schedit.library.dto.Dtos.AddCopyRequest;
+import com.schedit.library.dto.Dtos.AdvanceClockRequest;
+import com.schedit.library.dto.Dtos.BookDto;
+import com.schedit.library.dto.Dtos.BorrowRequest;
+import com.schedit.library.dto.Dtos.DowngradeRequest;
+import com.schedit.library.dto.Dtos.LoanDto;
+import com.schedit.library.dto.Dtos.MemberDto;
+import com.schedit.library.dto.Dtos.SettleRequest;
+import com.schedit.library.dto.Dtos.WaitingListEntryDto;
+import com.schedit.library.dto.Dtos.WaitlistRequest;
+import com.schedit.library.model.Book;
+import com.schedit.library.model.BookCopy;
+import com.schedit.library.model.Loan;
+import com.schedit.library.model.Member;
+import com.schedit.library.model.WaitingListEntry;
+import com.schedit.library.repository.BookCopyRepository;
+import com.schedit.library.repository.BookRepository;
+import com.schedit.library.repository.MemberRepository;
 import com.schedit.library.service.ClockService;
+import com.schedit.library.service.LibraryDtoMapper;
+import com.schedit.library.service.LibraryQueryService;
 import com.schedit.library.service.LibraryService;
-import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.ResponseEntity;
-import org.springframework.web.bind.annotation.*;
+import org.springframework.web.bind.annotation.CrossOrigin;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RestController;
 
 import java.math.BigDecimal;
 import java.time.LocalDate;
-import java.time.temporal.ChronoUnit;
 import java.util.List;
-import java.util.stream.Collectors;
 
+/**
+ * REST controller exposing the library operations to the frontend.
+ */
 @RestController
 @RequestMapping("/api")
 @CrossOrigin(origins = "*")
@@ -22,104 +46,130 @@ public class LibraryController {
 
     private final LibraryService libraryService;
     private final ClockService clockService;
+    private final LibraryQueryService queryService;
+    private final LibraryDtoMapper mapper;
     private final BookRepository bookRepository;
     private final BookCopyRepository copyRepository;
     private final MemberRepository memberRepository;
-    private final LoanRepository loanRepository;
-    private final WaitingListEntryRepository waitlistRepository;
 
-    @Autowired
+    /**
+     * Creates a controller with the application services and repositories it orchestrates.
+     */
     public LibraryController(LibraryService libraryService,
                              ClockService clockService,
+                             LibraryQueryService queryService,
+                             LibraryDtoMapper mapper,
                              BookRepository bookRepository,
                              BookCopyRepository copyRepository,
-                             MemberRepository memberRepository,
-                             LoanRepository loanRepository,
-                             WaitingListEntryRepository waitlistRepository) {
+                             MemberRepository memberRepository) {
         this.libraryService = libraryService;
         this.clockService = clockService;
+        this.queryService = queryService;
+        this.mapper = mapper;
         this.bookRepository = bookRepository;
         this.copyRepository = copyRepository;
         this.memberRepository = memberRepository;
-        this.loanRepository = loanRepository;
-        this.waitlistRepository = waitlistRepository;
     }
 
-    // --- Clock Endpoints ---
-
+    /**
+     * Returns the current virtual date used by the library rules.
+     */
     @GetMapping("/clock")
     public ResponseEntity<LocalDate> getClock() {
         return ResponseEntity.ok(clockService.getVirtualDate());
     }
 
+    /**
+     * Advances the virtual clock and expires any reservations that have passed their window.
+     */
     @PostMapping("/clock/advance")
     public ResponseEntity<LocalDate> advanceClock(@RequestBody AdvanceClockRequest request) {
         LocalDate newDate = clockService.advanceClock(request.days);
-        // Automatically check and expire older reservations on clock advancement
         libraryService.triggerExpirations();
         return ResponseEntity.ok(newDate);
     }
 
-    // --- Book Endpoints ---
-
+    /**
+     * Returns all books and their availability summary.
+     */
     @GetMapping("/books")
     public ResponseEntity<List<BookDto>> getBooks() {
-        List<Book> books = bookRepository.findAll();
-        List<BookDto> dtos = books.stream().map(this::toBookDto).collect(Collectors.toList());
-        return ResponseEntity.ok(dtos);
+        return ResponseEntity.ok(queryService.getBooks());
     }
 
+    /**
+     * Creates a new book in the catalog.
+     */
     @PostMapping("/books")
     public ResponseEntity<Book> addBook(@RequestBody AddBookRequest request) {
         Book book = new Book(request.title, request.author, request.isbn, request.replacementCost);
         return ResponseEntity.ok(bookRepository.save(book));
     }
 
+    /**
+     * Adds a physical copy to an existing book.
+     */
     @PostMapping("/books/{id}/copies")
     public ResponseEntity<BookCopy> addCopy(@PathVariable Long id, @RequestBody AddCopyRequest request) {
         Book book = bookRepository.findById(id)
                 .orElseThrow(() -> new IllegalArgumentException("Book not found"));
         BookCopy copy = new BookCopy(book, BookCopy.CopyStatus.AVAILABLE, request.barcode);
         BookCopy saved = copyRepository.save(copy);
-        // Process reservation queue in case a member is waiting
         libraryService.triggerExpirations();
         return ResponseEntity.ok(saved);
     }
 
+    /**
+     * Marks a copy as lost and applies the associated fee policy.
+     */
     @PostMapping("/copies/{id}/lost")
     public ResponseEntity<BookCopy> markLost(@PathVariable Long id) {
         return ResponseEntity.ok(libraryService.markCopyLost(id));
     }
 
+    /**
+     * Marks a copy as damaged and re-queues any affected reservations.
+     */
     @PostMapping("/copies/{id}/damaged")
     public ResponseEntity<BookCopy> markDamaged(@PathVariable Long id) {
         return ResponseEntity.ok(libraryService.markCopyDamaged(id));
     }
 
-    // --- Member Endpoints ---
-
+    /**
+     * Returns all registered members.
+     */
     @GetMapping("/members")
     public ResponseEntity<List<MemberDto>> getMembers() {
-        List<Member> members = memberRepository.findAll();
-        List<MemberDto> dtos = members.stream().map(this::toMemberDto).collect(Collectors.toList());
-        return ResponseEntity.ok(dtos);
+        return ResponseEntity.ok(queryService.getMembers());
     }
 
+    /**
+     * Creates a new library member.
+     */
     @PostMapping("/members")
     public ResponseEntity<Member> addMember(@RequestBody Member member) {
         member.setBalance(BigDecimal.ZERO);
         return ResponseEntity.ok(memberRepository.save(member));
     }
 
+    /**
+     * Updates the membership tier for a member.
+     */
     @PostMapping("/members/{id}/tier")
     public ResponseEntity<MemberDto> changeTier(@PathVariable Long id, @RequestBody DowngradeRequest request) {
         Member member = memberRepository.findById(id)
                 .orElseThrow(() -> new IllegalArgumentException("Member not found"));
         member.setTier(Member.MembershipTier.valueOf(request.tier.toUpperCase()));
         memberRepository.save(member);
-        return ResponseEntity.ok(toMemberDto(member));
+        return ResponseEntity.ok(queryService.getMembers().stream()
+                .filter(dto -> dto.id.equals(id))
+                .findFirst()
+                .orElseThrow(() -> new IllegalArgumentException("Member not found")));
     }
 
+    /**
+     * Settles a portion of a member's outstanding balance.
+     */
     @PostMapping("/members/{id}/settle")
     public ResponseEntity<MemberDto> settleFees(@PathVariable Long id, @RequestBody SettleRequest request) {
         Member member = memberRepository.findById(id)
@@ -130,194 +180,129 @@ public class LibraryController {
         }
         member.setBalance(member.getBalance().subtract(amount));
         memberRepository.save(member);
-        return ResponseEntity.ok(toMemberDto(member));
+        return ResponseEntity.ok(queryService.getMembers().stream()
+                .filter(dto -> dto.id.equals(id))
+                .findFirst()
+                .orElseThrow(() -> new IllegalArgumentException("Member not found")));
     }
 
-    // --- Lending Endpoints ---
-
+    /**
+     * Returns all currently active loans.
+     */
     @GetMapping("/loans/active")
     public ResponseEntity<List<LoanDto>> getActiveLoans() {
         LocalDate today = clockService.getVirtualDate();
-        List<Loan> loans = loanRepository.findAll().stream()
-                .filter(l -> l.getReturnDate() == null)
-                .collect(Collectors.toList());
-        List<LoanDto> dtos = loans.stream().map(l -> toLoanDto(l, today)).collect(Collectors.toList());
-        return ResponseEntity.ok(dtos);
+        return ResponseEntity.ok(queryService.getActiveLoans(today));
     }
 
+    /**
+     * Returns the active loans for a specific member.
+     */
     @GetMapping("/members/{memberId}/loans")
     public ResponseEntity<List<LoanDto>> getMemberLoans(@PathVariable Long memberId) {
         LocalDate today = clockService.getVirtualDate();
-        Member member = memberRepository.findById(memberId)
-                .orElseThrow(() -> new IllegalArgumentException("Member not found"));
-        List<Loan> loans = loanRepository.findByMemberAndReturnDateIsNull(member);
-        List<LoanDto> dtos = loans.stream().map(l -> toLoanDto(l, today)).collect(Collectors.toList());
-        return ResponseEntity.ok(dtos);
+        return ResponseEntity.ok(queryService.getMemberLoans(memberId, today));
     }
 
+    /**
+     * Borrows a book for the selected member if the business rules allow it.
+     */
     @PostMapping("/borrow")
     public ResponseEntity<?> borrowBook(@RequestBody BorrowRequest request) {
         try {
             Loan loan = libraryService.borrowBook(request.memberId, request.bookId);
             LocalDate today = clockService.getVirtualDate();
-            return ResponseEntity.ok(toLoanDto(loan, today));
+            return ResponseEntity.ok(mapper.toLoanDto(loan, today));
         } catch (Exception e) {
             return ResponseEntity.badRequest().body(e.getMessage());
         }
     }
 
+    /**
+     * Returns a checked-out copy to the catalog.
+     */
     @PostMapping("/return/{copyId}")
     public ResponseEntity<?> returnBook(@PathVariable Long copyId) {
         try {
             Loan loan = libraryService.returnBookCopy(copyId);
             LocalDate today = clockService.getVirtualDate();
-            return ResponseEntity.ok(toLoanDto(loan, today));
+            return ResponseEntity.ok(mapper.toLoanDto(loan, today));
         } catch (Exception e) {
             return ResponseEntity.badRequest().body(e.getMessage());
         }
     }
 
+    /**
+     * Renews an active loan if the member is still eligible.
+     */
     @PostMapping("/renew/{loanId}")
     public ResponseEntity<?> renewLoan(@PathVariable Long loanId) {
         try {
             Loan loan = libraryService.renewLoan(loanId);
             LocalDate today = clockService.getVirtualDate();
-            return ResponseEntity.ok(toLoanDto(loan, today));
+            return ResponseEntity.ok(mapper.toLoanDto(loan, today));
         } catch (Exception e) {
             return ResponseEntity.badRequest().body(e.getMessage());
         }
     }
 
-    // --- Waitlist Endpoints ---
-
+    /**
+     * Returns the current waitlist across the library.
+     */
     @GetMapping("/waitlist")
     public ResponseEntity<List<WaitingListEntryDto>> getWaitlist() {
         LocalDate today = clockService.getVirtualDate();
-        List<WaitingListEntry> entries = waitlistRepository.findAll();
-        List<WaitingListEntryDto> dtos = entries.stream().map(w -> toWaitlistDto(w, today)).collect(Collectors.toList());
-        return ResponseEntity.ok(dtos);
+        return ResponseEntity.ok(queryService.getWaitlist(today));
     }
 
+    /**
+     * Returns the waitlist entries created by a specific member.
+     */
     @GetMapping("/members/{memberId}/waitlist")
     public ResponseEntity<List<WaitingListEntryDto>> getMemberWaitlist(@PathVariable Long memberId) {
         LocalDate today = clockService.getVirtualDate();
-        Member member = memberRepository.findById(memberId)
-                .orElseThrow(() -> new IllegalArgumentException("Member not found"));
-        List<WaitingListEntry> entries = waitlistRepository.findActiveByMember(member);
-        List<WaitingListEntryDto> dtos = entries.stream().map(w -> toWaitlistDto(w, today)).collect(Collectors.toList());
-        return ResponseEntity.ok(dtos);
+        return ResponseEntity.ok(queryService.getMemberWaitlist(memberId, today));
     }
 
+    /**
+     * Adds a member to the waiting list for a book.
+     */
     @PostMapping("/waitlist/join")
     public ResponseEntity<?> joinWaitlist(@RequestBody WaitlistRequest request) {
         try {
             WaitingListEntry entry = libraryService.joinWaitlist(request.memberId, request.bookId);
             LocalDate today = clockService.getVirtualDate();
-            return ResponseEntity.ok(toWaitlistDto(entry, today));
+            return ResponseEntity.ok(mapper.toWaitlistDto(entry, today));
         } catch (Exception e) {
             return ResponseEntity.badRequest().body(e.getMessage());
         }
     }
 
+    /**
+     * Cancels a waitlist entry if it is still active.
+     */
     @PostMapping("/waitlist/cancel/{entryId}")
     public ResponseEntity<?> cancelWaitlist(@PathVariable Long entryId) {
         try {
             WaitingListEntry entry = libraryService.cancelWaitlist(entryId);
             LocalDate today = clockService.getVirtualDate();
-            return ResponseEntity.ok(toWaitlistDto(entry, today));
+            return ResponseEntity.ok(mapper.toWaitlistDto(entry, today));
         } catch (Exception e) {
             return ResponseEntity.badRequest().body(e.getMessage());
         }
     }
 
+    /**
+     * Collects a reservation and creates the borrowing record for the member.
+     */
     @PostMapping("/waitlist/collect/{entryId}/member/{memberId}")
     public ResponseEntity<?> collectReservation(@PathVariable Long entryId, @PathVariable Long memberId) {
         try {
             Loan loan = libraryService.collectReservation(memberId, entryId);
             LocalDate today = clockService.getVirtualDate();
-            return ResponseEntity.ok(toLoanDto(loan, today));
+            return ResponseEntity.ok(mapper.toLoanDto(loan, today));
         } catch (Exception e) {
             return ResponseEntity.badRequest().body(e.getMessage());
         }
-    }
-
-    // --- DTO Converters ---
-
-    private BookDto toBookDto(Book book) {
-        BookDto dto = new BookDto();
-        dto.id = book.getId();
-        dto.title = book.getTitle();
-        dto.author = book.getAuthor();
-        dto.isbn = book.getIsbn();
-        dto.replacementCost = book.getReplacementCost();
-
-        List<BookCopy> copies = copyRepository.findByBook(book);
-        dto.totalCopies = copies.size();
-        dto.availableCopies = (int) copies.stream().filter(c -> c.getStatus() == BookCopy.CopyStatus.AVAILABLE).count();
-        dto.reservedCopies = (int) copies.stream().filter(c -> c.getStatus() == BookCopy.CopyStatus.RESERVED).count();
-        
-        List<WaitingListEntry> activeWait = waitlistRepository.findActiveByBookOrderByCreatedAtAsc(book);
-        dto.waitingListCount = (int) activeWait.stream().filter(w -> w.getStatus() == WaitingListEntry.WaitlistStatus.WAITING).count();
-
-        dto.copies = copies.stream().map(c -> {
-            CopyDto cd = new CopyDto();
-            cd.id = c.getId();
-            cd.barcode = c.getBarcode();
-            cd.status = c.getStatus().name();
-            return cd;
-        }).collect(Collectors.toList());
-
-        return dto;
-    }
-
-    private MemberDto toMemberDto(Member member) {
-        MemberDto dto = new MemberDto();
-        dto.id = member.getId();
-        dto.name = member.getName();
-        dto.email = member.getEmail();
-        dto.tier = member.getTier().name();
-        dto.balance = member.getBalance();
-        dto.activeLoansCount = loanRepository.findByMemberAndReturnDateIsNull(member).size();
-        return dto;
-    }
-
-    private LoanDto toLoanDto(Loan loan, LocalDate today) {
-        LoanDto dto = new LoanDto();
-        dto.id = loan.getId();
-        dto.bookTitle = loan.getBookCopy().getBook().getTitle();
-        dto.copyBarcode = loan.getBookCopy().getBarcode();
-        dto.copyId = loan.getBookCopy().getId();
-        dto.memberId = loan.getMember().getId();
-        dto.memberName = loan.getMember().getName();
-        dto.borrowDate = loan.getBorrowDate();
-        dto.dueDate = loan.getDueDate();
-        dto.returnDate = loan.getReturnDate();
-        dto.feeCharged = loan.getFeeCharged();
-        dto.isOverdue = loan.getReturnDate() == null && today.isAfter(loan.getDueDate());
-        return dto;
-    }
-
-    private WaitingListEntryDto toWaitlistDto(WaitingListEntry w, LocalDate today) {
-        WaitingListEntryDto dto = new WaitingListEntryDto();
-        dto.id = w.getId();
-        dto.bookId = w.getBook().getId();
-        dto.bookTitle = w.getBook().getTitle();
-        dto.memberId = w.getMember().getId();
-        dto.memberName = w.getMember().getName();
-        dto.status = w.getStatus().name();
-        dto.createdAt = w.getCreatedAt();
-        dto.reservedAt = w.getReservedAt();
-        if (w.getReservedCopy() != null) {
-            dto.reservedCopyBarcode = w.getReservedCopy().getBarcode();
-            dto.reservedCopyId = w.getReservedCopy().getId();
-            if (w.getReservedAt() != null) {
-                LocalDate expirationDate = w.getReservedAt().toLocalDate().plusDays(3);
-                dto.daysRemaining = ChronoUnit.DAYS.between(today, expirationDate);
-                if (dto.daysRemaining < 0) {
-                    dto.daysRemaining = 0L;
-                }
-            }
-        }
-        return dto;
     }
 }

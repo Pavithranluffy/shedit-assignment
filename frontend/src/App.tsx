@@ -1,65 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
-
-type Role = 'member' | 'librarian';
-
-type Member = {
-  id: number;
-  name: string;
-  email: string;
-  tier: string;
-  balance: number;
-  activeLoansCount: number;
-};
-
-type Book = {
-  id: number;
-  title: string;
-  author: string;
-  isbn: string;
-  replacementCost: number;
-  totalCopies: number;
-  availableCopies: number;
-  reservedCopies: number;
-  waitingListCount: number;
-  copies: Array<{ id: number; barcode: string; status: string }>;
-};
-
-type Loan = {
-  id: number;
-  bookTitle: string;
-  copyBarcode: string;
-  copyId: number;
-  memberId: number;
-  memberName: string;
-  borrowDate: string;
-  dueDate: string;
-  returnDate: string | null;
-  feeCharged: number;
-  isOverdue: boolean;
-};
-
-type WaitlistEntry = {
-  id: number;
-  bookId: number;
-  bookTitle: string;
-  memberId: number;
-  memberName: string;
-  status: string;
-  reservedCopyBarcode?: string;
-  daysRemaining?: number;
-};
-
-async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(path, {
-    headers: { 'Content-Type': 'application/json' },
-    ...init,
-  });
-  const text = await res.text();
-  if (!res.ok) {
-    throw new Error(text || 'Request failed');
-  }
-  return text ? (JSON.parse(text) as T) : ({} as T);
-}
+import { requestJson } from './api';
+import type { Book, Loan, Member, Role, WaitlistEntry } from './types';
 
 export default function App() {
   const [role, setRole] = useState<Role>('member');
